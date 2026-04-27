@@ -208,24 +208,37 @@ pipeline:
                               ;;
                           esac
 
-                          case "$(normalize_token "$EXECUTION_MODE_RAW")" in
+                          EXECUTION_MODE_NORMALIZED="$(normalize_token "$EXECUTION_MODE_RAW")"
+                          case "$EXECUTION_MODE_NORMALIZED" in
                             plan|plan_only|plan-only)
                               EXECUTION_MODE="plan_only"
                               ;;
-                            plan_manual_apply|plan-manual-apply|manual_apply|manual-apply)
-                              EXECUTION_MODE="plan_manual_apply"
+                            plan_manual_apply|plan-manual-apply|plan_and_manual_apply|plan-and-manual-apply|manual_apply|manual-apply)
+                              EXECUTION_MODE="plan_and_manual_apply"
                               ;;
-                            auto|auto_apply|auto-apply|apply_auto|apply-auto)
-                              EXECUTION_MODE="auto_apply"
+                            auto|auto_apply|auto-apply|plan_auto_apply|plan-auto-apply|plan_and_auto_apply|plan-and-auto-apply|apply_auto|apply-auto)
+                              EXECUTION_MODE="plan_and_auto_apply"
                               ;;
                             *)
-                              echo "ERROR: Invalid execution mode: $EXECUTION_MODE_RAW"
-                              exit 1
+                              if [[ "$EXECUTION_MODE_NORMALIZED" == *plan_only* ]]; then
+                                EXECUTION_MODE="plan_only"
+                              elif [[ "$EXECUTION_MODE_NORMALIZED" == *manual* && "$EXECUTION_MODE_NORMALIZED" == *apply* ]]; then
+                                EXECUTION_MODE="plan_and_manual_apply"
+                              elif [[ "$EXECUTION_MODE_NORMALIZED" == *auto* && "$EXECUTION_MODE_NORMALIZED" == *apply* ]]; then
+                                EXECUTION_MODE="plan_and_auto_apply"
+                              else
+                                echo "ERROR: Invalid execution mode: $EXECUTION_MODE_RAW"
+                                echo "Accepted values: plan_only, plan_and_manual_apply, plan_and_auto_apply"
+                                echo "Accepted IDP aliases include: plan_and_manual_apply, plan_and_auto_apply"
+                                exit 1
+                              fi
                               ;;
                           esac
 
-                          if [[ "$ENVIRONMENT_TIER" == "prod" && "$EXECUTION_MODE" == "auto_apply" ]]; then
-                            echo "ERROR: Production cannot use auto_apply execution mode"
+                          echo "Normalized execution mode: ${EXECUTION_MODE_RAW} -> ${EXECUTION_MODE}"
+
+                          if [[ "$ENVIRONMENT_TIER" == "prod" && "$EXECUTION_MODE" == "plan_and_auto_apply" ]]; then
+                            echo "ERROR: Production cannot use plan_and_auto_apply execution mode"
                             exit 1
                           fi
 
