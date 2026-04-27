@@ -80,10 +80,6 @@ pipeline:
       type: String
       required: true
       value: <+input>
-    - name: idp_request_json
-      type: String
-      required: false
-      value: <+input>.default("{}")
     - name: triggeredByName
       type: String
       required: false
@@ -122,6 +118,10 @@ pipeline:
       type: String
       required: true
       value: workspace-requests
+    - name: jq_download_base_url
+      type: String
+      required: false
+      value: https://github.com/jqlang/jq/releases/download/jq-1.7.1
 
   stages:
     - stage:
@@ -173,12 +173,36 @@ pipeline:
                           IACM_CODE_REPO='<+pipeline.variables.iacm_code_repo>'
                           IACM_CODE_BRANCH='<+pipeline.variables.iacm_code_branch>'
                           IACM_CODE_PATH='<+pipeline.variables.iacm_code_path>'
+                          REQUESTED_BY_NAME='<+pipeline.variables.triggeredByName>'
+                          REQUESTED_BY_EMAIL='<+pipeline.variables.triggeredByEmail>'
+                          HARNESS_TRIGGERED_BY_NAME='<+pipeline.triggeredBy.name>'
+                          HARNESS_TRIGGERED_BY_EMAIL='<+pipeline.triggeredBy.email>'
 
                           normalize_token() {
                             printf '%s' "$1" \
                               | tr '[:upper:]' '[:lower:]' \
                               | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/[[:space:]]+/_/g; s/[^a-z0-9._-]+/_/g; s/_+/_/g'
                           }
+
+                          is_empty_or_unresolved() {
+                            [[ -z "$1" || "$1" == "null" || "$1" == "<+input>" || "$1" == "<+"* ]]
+                          }
+
+                          if is_empty_or_unresolved "$REQUESTED_BY_NAME"; then
+                            REQUESTED_BY_NAME="$HARNESS_TRIGGERED_BY_NAME"
+                          fi
+
+                          if is_empty_or_unresolved "$REQUESTED_BY_EMAIL"; then
+                            REQUESTED_BY_EMAIL="$HARNESS_TRIGGERED_BY_EMAIL"
+                          fi
+
+                          if is_empty_or_unresolved "$REQUESTED_BY_NAME"; then
+                            REQUESTED_BY_NAME="unknown"
+                          fi
+
+                          if is_empty_or_unresolved "$REQUESTED_BY_EMAIL"; then
+                            REQUESTED_BY_EMAIL="unknown"
+                          fi
 
                           CLOUD="$(normalize_token "$CLOUD_RAW")"
                           if [[ "$CLOUD" != "gcp" ]]; then
@@ -294,6 +318,7 @@ pipeline:
                           echo "  tier: ${ENVIRONMENT_TIER}"
                           echo "  execution mode: ${EXECUTION_MODE}"
                           echo "  request file: ${REQUEST_FILE}"
+                          echo "  requested by: ${REQUESTED_BY_NAME} / ${REQUESTED_BY_EMAIL}"
 
                           PROJECT_ID="$PROJECT_ID"
                     outputVariables:
@@ -336,6 +361,12 @@ pipeline:
                       - name: DATA_SENSITIVITY_LEVEL
                         type: String
                         value: DATA_SENSITIVITY_LEVEL
+                      - name: REQUESTED_BY_NAME
+                        type: String
+                        value: REQUESTED_BY_NAME
+                      - name: REQUESTED_BY_EMAIL
+                        type: String
+                        value: REQUESTED_BY_EMAIL
 
               - step:
                   name: Precheck Workspace Does Not Exist
@@ -357,11 +388,17 @@ pipeline:
                           ACCOUNT_ID='<+account.identifier>'
                           HARNESS_BASE_URL='<+pipeline.variables.harness_base_url>'
 
-                          HARNESS_API="${HARNESS_BASE_URL}/gateway/iacm/api/orgs/${ORGANIZATION_ID}/projects/${PROJECT_ID}/workspaces/${WORKSPACE_NAME}"
+                          if [[ -z "${HARNESS_API_KEY:-}" ]]; then
+                            echo "ERROR: HARNESS_API_KEY is empty. Check Harness secret: harness_platform_api_key"
+                            exit 1
+                          fi
+
+                          HARNESS_API="${HARNESS_BASE_URL}/iacm/api/orgs/${ORGANIZATION_ID}/projects/${PROJECT_ID}/workspaces/${WORKSPACE_NAME}"
 
                           RESPONSE_CODE="$(curl -sS -o /tmp/iacm-workspace-precheck.json -w "%{http_code}" \
                             -H "Harness-Account: ${ACCOUNT_ID}" \
                             -H "x-api-key: ${HARNESS_API_KEY}" \
+                            -H "Accept: application/json" \
                             -H "Content-Type: application/json" \
                             "$HARNESS_API")"
 
@@ -373,7 +410,11 @@ pipeline:
 
                           if [[ "$RESPONSE_CODE" != "404" ]]; then
                             echo "ERROR: Unable to confirm workspace availability. HTTP ${RESPONSE_CODE}"
-                            cat /tmp/iacm-workspace-precheck.json || true
+                            if [[ "$RESPONSE_CODE" == "401" ]]; then
+                              echo "Check that harness_base_url is the Harness API host, the secret harness_platform_api_key contains a valid Harness API token, and the token has access to org/project/IaCM."
+                            else
+                              sed -n '1,40p' /tmp/iacm-workspace-precheck.json || true
+                            fi
                             PRECHECK_STATUS="precheck_failed"
                             exit 1
                           fi
@@ -453,6 +494,42 @@ pipeline:
                         script: |
                           set -euo pipefail
 
+                          TOOLS_DIR="${TOOLS_DIR:-/tmp/iacm-tools-<+pipeline.sequenceId>}"
+                          mkdir -p "$TOOLS_DIR"
+                          export PATH="$TOOLS_DIR:$PATH"
+
+                          for cmd in git curl base64 uname chmod mkdir; do
+                            if ! command -v "$cmd" >/dev/null 2>&1; then
+                              echo "ERROR: Required command not found on delegate: $cmd"
+                              exit 1
+                            fi
+                          done
+
+                          download_jq_if_possible() {
+                            if command -v jq >/dev/null 2>&1; then
+                              return 0
+                            fi
+
+                            case "$(uname -m)" in
+                              x86_64|amd64)
+                                jq_asset="jq-linux-amd64"
+                                ;;
+                              aarch64|arm64)
+                                jq_asset="jq-linux-arm64"
+                                ;;
+                              *)
+                                echo "Unsupported delegate CPU architecture for jq auto-download: $(uname -m)"
+                                return 1
+                                ;;
+                            esac
+
+                            jq_url="${JQ_DOWNLOAD_BASE_URL%/}/${jq_asset}"
+                            echo "Attempting to download jq for this execution from: ${jq_url}"
+                            if curl -fsSL "$jq_url" -o "${TOOLS_DIR}/jq"; then
+                              chmod +x "${TOOLS_DIR}/jq"
+                            fi
+                          }
+
                           install_jq_if_missing() {
                             if command -v jq >/dev/null 2>&1; then
                               echo "jq already available"
@@ -488,21 +565,25 @@ pipeline:
                             fi
 
                             if ! command -v jq >/dev/null 2>&1; then
-                              echo "ERROR: jq is required but could not be installed automatically."
-                              echo "Install jq on the Harness delegate image/host, or use a delegate image that includes jq."
+                              download_jq_if_possible || true
+                            fi
+
+                            if ! command -v jq >/dev/null 2>&1; then
+                              echo "ERROR: jq is required but could not be made available automatically."
+                              echo "Install jq on the Harness delegate image/host, or set jq_download_base_url to an internal mirror that the delegate can reach."
                               exit 1
                             fi
                           }
 
-                          for cmd in git curl base64; do
-                            if ! command -v "$cmd" >/dev/null 2>&1; then
-                              echo "ERROR: Required command not found on delegate: $cmd"
-                              exit 1
-                            fi
-                          done
-
                           install_jq_if_missing
                           jq --version
+                    environmentVariables:
+                      - name: TOOLS_DIR
+                        type: String
+                        value: <+execution.steps.select_execution_workspace.output.outputVariables.TOOLS_DIR>
+                      - name: JQ_DOWNLOAD_BASE_URL
+                        type: String
+                        value: <+pipeline.variables.jq_download_base_url>
 
               - step:
                   name: Clone Platform Factory Repo
@@ -561,6 +642,7 @@ pipeline:
                       spec:
                         script: |
                           set -euo pipefail
+                          export PATH="${TOOLS_DIR}:$PATH"
 
                           cd "$WORKDIR"
 
@@ -581,16 +663,6 @@ pipeline:
                           APPLICATION_ID='<+pipeline.variables.application_id>'
                           APPLICATION_NAME='<+pipeline.variables.application_name>'
                           REQUESTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-                          IDP_REQUEST_JSON="${IDP_REQUEST_JSON:-{}}"
-
-                          if [[ -z "$IDP_REQUEST_JSON" || "$IDP_REQUEST_JSON" == "<+input>" || "$IDP_REQUEST_JSON" == "null" ]]; then
-                            IDP_REQUEST_JSON="{}"
-                          fi
-
-                          if ! echo "$IDP_REQUEST_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
-                            echo "ERROR: idp_request_json must be a valid JSON object"
-                            exit 1
-                          fi
 
                           if [[ -e "$REQUEST_FILE" ]]; then
                             echo "ERROR: Workspace request already exists: $REQUEST_FILE"
@@ -622,10 +694,9 @@ pipeline:
                             --arg secondary_owner '<+pipeline.variables.secondary_owner_id>' \
                             --arg business_criticality "$BUSINESS_CRITICALITY" \
                             --arg data_sensitivity_level "$DATA_SENSITIVITY_LEVEL" \
-                            --arg requested_by_name '<+pipeline.variables.triggeredByName>' \
-                            --arg requested_by_email '<+pipeline.variables.triggeredByEmail>' \
+                            --arg requested_by_name '<+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.REQUESTED_BY_NAME>' \
+                            --arg requested_by_email '<+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.REQUESTED_BY_EMAIL>' \
                             --arg pipeline_execution_url '<+pipeline.executionUrl>' \
-                            --argjson idp_request "$IDP_REQUEST_JSON" \
                             '{
                               ($ws): {
                                 schema_version: 1,
@@ -653,30 +724,6 @@ pipeline:
                                   name: $requested_by_name,
                                   email: $requested_by_email
                                 },
-                                metadata: (
-                                  $idp_request
-                                  | del(
-                                      .organizationId,
-                                      .projectId,
-                                      .application_id,
-                                      .application_name,
-                                      .cloud,
-                                      .environment_tier,
-                                      .execution_mode,
-                                      .primary_owner_id,
-                                      .secondary_owner_id,
-                                      .business_criticality,
-                                      .data_sensitivity_level,
-                                      .gcp_project_id,
-                                      .gcp_region,
-                                      .gcp_folder_id,
-                                      .gcp_connector,
-                                      .iacm_code_repo,
-                                      .iacm_code_branch,
-                                      .iacm_code_path
-                                    )
-                                  | with_entries(select(.value != null and .value != ""))
-                                ),
                                 source: {
                                   system: "harness-idp",
                                   pipeline_sequence_id: $pipeline_sequence_id,
@@ -713,9 +760,9 @@ pipeline:
                       - name: WORKDIR
                         type: String
                         value: <+execution.steps.select_execution_workspace.output.outputVariables.WORKDIR>
-                      - name: IDP_REQUEST_JSON
+                      - name: TOOLS_DIR
                         type: String
-                        value: <+pipeline.variables.idp_request_json>
+                        value: <+execution.steps.select_execution_workspace.output.outputVariables.TOOLS_DIR>
 
               - step:
                   name: Validate Factory Config
@@ -732,6 +779,7 @@ pipeline:
                       spec:
                         script: |
                           set -euo pipefail
+                          export PATH="${TOOLS_DIR}:$PATH"
 
                           cd "$WORKDIR"
 
@@ -792,6 +840,9 @@ pipeline:
                       - name: WORKDIR
                         type: String
                         value: <+execution.steps.select_execution_workspace.output.outputVariables.WORKDIR>
+                      - name: TOOLS_DIR
+                        type: String
+                        value: <+execution.steps.select_execution_workspace.output.outputVariables.TOOLS_DIR>
 
               - step:
                   name: Commit and Push Request
@@ -855,6 +906,7 @@ pipeline:
                       spec:
                         script: |
                           set -euo pipefail
+                          export PATH="${TOOLS_DIR}:$PATH"
 
                           SCM_API_BASE_URL='<+pipeline.variables.scm_api_base_url>'
                           SCM_OWNER='<+pipeline.variables.scm_org_or_owner>'
@@ -875,7 +927,7 @@ pipeline:
                           Environment: ${ENVIRONMENT_TIER}
                           Execution mode: ${EXECUTION_MODE}
                           Request file: ${REQUEST_FILE}
-                          Requested by: <+pipeline.variables.triggeredByName> / <+pipeline.variables.triggeredByEmail>
+                          Requested by: <+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.REQUESTED_BY_NAME> / <+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.REQUESTED_BY_EMAIL>
 
                           This PR was generated by Harness IDP and the IaCM intake backend pipeline.
 
@@ -910,6 +962,9 @@ pipeline:
                           echo "PR_NUMBER=$PR_NUMBER"
                           echo "PR_HEAD_SHA=$PR_HEAD_SHA"
                     environmentVariables:
+                      - name: TOOLS_DIR
+                        type: String
+                        value: <+execution.steps.select_execution_workspace.output.outputVariables.TOOLS_DIR>
                       - name: SCM_TOKEN
                         type: Secret
                         value: iacm_scm_pat
@@ -975,7 +1030,7 @@ pipeline:
                       Environment: <+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.ENVIRONMENT_TIER>
                       Execution mode: <+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.EXECUTION_MODE>
                       Pull request: <+pipeline.stages.create_workspace_pull_request.spec.execution.steps.create_pull_request.output.outputVariables.PR_URL>
-                      Requested by: <+pipeline.variables.triggeredByName> / <+pipeline.variables.triggeredByEmail>
+                      Requested by: <+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.REQUESTED_BY_NAME> / <+pipeline.stages.normalize_and_validate.spec.execution.steps.normalize_inputs.output.outputVariables.REQUESTED_BY_EMAIL>
 
                       Approve only after the PR diff and repository checks are acceptable.
                     includePipelineExecutionHistory: true
@@ -1014,6 +1069,42 @@ pipeline:
                         script: |
                           set -euo pipefail
 
+                          TOOLS_DIR="${TOOLS_DIR:-/tmp/iacm-tools-<+pipeline.sequenceId>}"
+                          mkdir -p "$TOOLS_DIR"
+                          export PATH="$TOOLS_DIR:$PATH"
+
+                          for cmd in curl uname chmod mkdir; do
+                            if ! command -v "$cmd" >/dev/null 2>&1; then
+                              echo "ERROR: Required command not found on delegate: $cmd"
+                              exit 1
+                            fi
+                          done
+
+                          download_jq_if_possible() {
+                            if command -v jq >/dev/null 2>&1; then
+                              return 0
+                            fi
+
+                            case "$(uname -m)" in
+                              x86_64|amd64)
+                                jq_asset="jq-linux-amd64"
+                                ;;
+                              aarch64|arm64)
+                                jq_asset="jq-linux-arm64"
+                                ;;
+                              *)
+                                echo "Unsupported delegate CPU architecture for jq auto-download: $(uname -m)"
+                                return 1
+                                ;;
+                            esac
+
+                            jq_url="${JQ_DOWNLOAD_BASE_URL%/}/${jq_asset}"
+                            echo "Attempting to download jq for this execution from: ${jq_url}"
+                            if curl -fsSL "$jq_url" -o "${TOOLS_DIR}/jq"; then
+                              chmod +x "${TOOLS_DIR}/jq"
+                            fi
+                          }
+
                           install_jq_if_missing() {
                             if command -v jq >/dev/null 2>&1; then
                               echo "jq already available"
@@ -1049,16 +1140,15 @@ pipeline:
                             fi
 
                             if ! command -v jq >/dev/null 2>&1; then
-                              echo "ERROR: jq is required but could not be installed automatically."
-                              echo "Install jq on the Harness delegate image/host, or use a delegate image that includes jq."
+                              download_jq_if_possible || true
+                            fi
+
+                            if ! command -v jq >/dev/null 2>&1; then
+                              echo "ERROR: jq is required but could not be made available automatically."
+                              echo "Install jq on the Harness delegate image/host, or set jq_download_base_url to an internal mirror that the delegate can reach."
                               exit 1
                             fi
                           }
-
-                          if ! command -v curl >/dev/null 2>&1; then
-                            echo "ERROR: Required command not found on delegate: curl"
-                            exit 1
-                          fi
 
                           install_jq_if_missing
                           jq --version
@@ -1130,6 +1220,9 @@ pipeline:
                           echo "CURRENT_HEAD_REF=$CURRENT_HEAD_REF"
                           echo "CURRENT_HEAD_SHA=$CURRENT_HEAD_SHA"
                     environmentVariables:
+                      - name: JQ_DOWNLOAD_BASE_URL
+                        type: String
+                        value: <+pipeline.variables.jq_download_base_url>
                       - name: SCM_TOKEN
                         type: Secret
                         value: iacm_scm_pat
@@ -1164,7 +1257,12 @@ pipeline:
                           ACCOUNT_ID='<+account.identifier>'
                           HARNESS_BASE_URL='<+pipeline.variables.harness_base_url>'
 
-                          HARNESS_API="${HARNESS_BASE_URL}/gateway/iacm/api/orgs/${ORGANIZATION_ID}/projects/${PROJECT_ID}/workspaces/${WORKSPACE_NAME}"
+                          if [[ -z "${HARNESS_API_KEY:-}" ]]; then
+                            echo "ERROR: HARNESS_API_KEY is empty. Check Harness secret: harness_platform_api_key"
+                            exit 1
+                          fi
+
+                          HARNESS_API="${HARNESS_BASE_URL}/iacm/api/orgs/${ORGANIZATION_ID}/projects/${PROJECT_ID}/workspaces/${WORKSPACE_NAME}"
 
                           MAX_ATTEMPTS=15
                           POLL_INTERVAL=60
@@ -1176,6 +1274,7 @@ pipeline:
                             RESPONSE_CODE="$(curl -sS -o /tmp/iacm-workspace-response.json -w "%{http_code}" \
                               -H "Harness-Account: ${ACCOUNT_ID}" \
                               -H "x-api-key: ${HARNESS_API_KEY}" \
+                              -H "Accept: application/json" \
                               -H "Content-Type: application/json" \
                               "$HARNESS_API")"
 
@@ -1193,7 +1292,9 @@ pipeline:
 
                           if [[ "$WORKSPACE_STATUS" != "created" ]]; then
                             echo "ERROR: Workspace was not found after merge"
-                            cat /tmp/iacm-workspace-response.json || true
+                            if [[ -f /tmp/iacm-workspace-response.json ]]; then
+                              sed -n '1,40p' /tmp/iacm-workspace-response.json || true
+                            fi
                             exit 1
                           fi
 
