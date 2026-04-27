@@ -1,0 +1,647 @@
+pipeline:
+  name: iacm-workspace-intake
+  identifier: iacm_workspace_intake
+  description: Creates IaCM workspace request, raises PR, merges after approval, and verifies workspace.
+  tags: {}
+
+  variables:
+    - name: organizationId
+      type: String
+      required: true
+      value: <+input>
+    - name: projectId
+      type: String
+      required: true
+      value: <+input>
+    - name: cloud
+      type: String
+      required: true
+      value: <+input>
+    - name: environment_tier
+      type: String
+      required: true
+      value: <+input>
+    - name: execution_mode
+      type: String
+      required: true
+      value: <+input>
+    - name: primary_owner_id
+      type: String
+      required: true
+      value: <+input>
+    - name: secondary_owner_id
+      type: String
+      required: true
+      value: <+input>
+    - name: business_criticality
+      type: String
+      required: true
+      value: <+input>
+    - name: data_sensitivity_level
+      type: String
+      required: true
+      value: <+input>
+    - name: gcp_project_id
+      type: String
+      required: true
+      value: <+input>
+    - name: gcp_region
+      type: String
+      required: true
+      value: <+input>
+    - name: gcp_folder_id
+      type: String
+      required: false
+      value: <+input>
+    - name: gcp_connector
+      type: String
+      required: true
+      value: <+input>
+    - name: iacm_code_repo
+      type: String
+      required: true
+      value: <+input>
+    - name: iacm_code_branch
+      type: String
+      required: true
+      value: <+input>
+    - name: iacm_code_path
+      type: String
+      required: true
+      value: <+input>
+    - name: triggeredByName
+      type: String
+      required: false
+      value: <+input>
+    - name: triggeredByEmail
+      type: String
+      required: false
+      value: <+input>
+    - name: git_api_base_url
+      type: String
+      required: true
+      value: <+input>
+    - name: git_org_or_owner
+      type: String
+      required: true
+      value: <+input>
+    - name: git_repo_name
+      type: String
+      required: true
+      value: <+input>
+    - name: harness_base_url
+      type: String
+      required: true
+      value: https://app.harness.io
+
+  stages:
+    - stage:
+        name: Validate and Prepare
+        identifier: validate_and_prepare
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Validate Inputs
+                  identifier: validate_inputs
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          echo "=== Validating Inputs ==="
+
+                          ORG="<+pipeline.variables.organizationId>"
+                          PROJECT="<+pipeline.variables.projectId>"
+                          ENV_TIER="<+pipeline.variables.environment_tier>"
+                          CLOUD="<+pipeline.variables.cloud>"
+                          EXECUTION_MODE="<+pipeline.variables.execution_mode>"
+                          PRIMARY_OWNER="<+pipeline.variables.primary_owner_id>"
+                          SECONDARY_OWNER="<+pipeline.variables.secondary_owner_id>"
+
+                          if [[ "$PRIMARY_OWNER" == "$SECONDARY_OWNER" ]]; then
+                            echo "ERROR: Primary and Secondary owner must be different people"
+                            exit 1
+                          fi
+
+                          if [[ "$ENV_TIER" == "prod" && "$EXECUTION_MODE" != "plan_only" ]]; then
+                            echo "ERROR: Production environment only supports plan_only execution mode"
+                            exit 1
+                          fi
+
+                          if [[ -z "$PROJECT" ]]; then
+                            echo "ERROR: Project name is empty"
+                            exit 1
+                          fi
+
+                          WS_NAME="${PROJECT}-${ENV_TIER}"
+
+                          case "$ENV_TIER" in
+                            dev)
+                              WS_TEMPLATE="ws-nonprod-auto"
+                              PIPELINE_TEMPLATE="iacm_provision_auto"
+                              ;;
+                            staging)
+                              WS_TEMPLATE="ws-nonprod-approval"
+                              PIPELINE_TEMPLATE="iacm_provision_approval"
+                              ;;
+                            prod)
+                              WS_TEMPLATE="ws-prod"
+                              PIPELINE_TEMPLATE="iacm_provision_prod"
+                              ;;
+                            *)
+                              echo "ERROR: Invalid environment tier: $ENV_TIER"
+                              exit 1
+                              ;;
+                          esac
+
+                          echo "PROJECT=$PROJECT"
+                          echo "WS_NAME=$WS_NAME"
+                          echo "WS_TEMPLATE=$WS_TEMPLATE"
+                          echo "PIPELINE_TEMPLATE=$PIPELINE_TEMPLATE"
+                    outputVariables:
+                      - name: PROJECT
+                        type: String
+                        value: PROJECT
+                      - name: WS_NAME
+                        type: String
+                        value: WS_NAME
+                      - name: WS_TEMPLATE
+                        type: String
+                        value: WS_TEMPLATE
+                      - name: PIPELINE_TEMPLATE
+                        type: String
+                        value: PIPELINE_TEMPLATE
+
+    - stage:
+        name: Generate Terraform Config
+        identifier: generate_terraform_config
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Clone Repo
+                  identifier: clone_repo
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          GIT_API_BASE_URL="<+pipeline.variables.git_api_base_url>"
+                          GIT_ORG="<+pipeline.variables.git_org_or_owner>"
+                          GIT_REPO="<+pipeline.variables.git_repo_name>"
+                          BRANCH_NAME="iacm/<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+
+                          REPO_URL="${GIT_API_BASE_URL}/${GIT_ORG}/${GIT_REPO}.git"
+
+                          echo "=== Cloning Repository ==="
+                          rm -rf /tmp/iacm-workspace-repo
+                          git clone "$REPO_URL" /tmp/iacm-workspace-repo
+                          cd /tmp/iacm-workspace-repo
+
+                          git checkout -b "$BRANCH_NAME"
+                          git config user.email "iacm-automation@example.com"
+                          git config user.name "Harness IaCM Automation"
+
+                          echo "BRANCH_NAME=$BRANCH_NAME"
+                    environmentVariables:
+                      - name: GITHUB_TOKEN
+                        type: Secret
+                        value: github-token
+                    outputVariables:
+                      - name: BRANCH_NAME
+                        type: String
+                        value: BRANCH_NAME
+
+              - step:
+                  name: Generate Workspace Entry
+                  identifier: generate_workspace_entry
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          cd /tmp/iacm-workspace-repo
+
+                          WS_NAME="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+                          WS_TEMPLATE="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_TEMPLATE>"
+                          PIPELINE_TEMPLATE="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.PIPELINE_TEMPLATE>"
+                          PROJECT="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.PROJECT>"
+
+                          TFVARS_FILE="workspaces-gcp.auto.tfvars"
+
+                          if [[ -f "$TFVARS_FILE" && $(grep -c "$WS_NAME" "$TFVARS_FILE") -gt 0 ]]; then
+                            echo "ERROR: Workspace $WS_NAME already exists in $TFVARS_FILE"
+                            exit 1
+                          fi
+
+                          if [[ ! -f "$TFVARS_FILE" ]]; then
+                            echo "workspace_config = {}" > "$TFVARS_FILE"
+                          fi
+
+                          if tail -1 "$TFVARS_FILE" | grep -q "^}$"; then
+                            sed -i '$d' "$TFVARS_FILE"
+                          fi
+
+                          GCP_FOLDER_ID="<+pipeline.variables.gcp_folder_id>"
+                          FOLDER_LINE=""
+                          if [[ -n "$GCP_FOLDER_ID" && "$GCP_FOLDER_ID" != "<+input>" && "$GCP_FOLDER_ID" != "null" ]]; then
+                            FOLDER_LINE="    gcp_folder_id = \"$GCP_FOLDER_ID\""
+                          fi
+
+                          cat >> "$TFVARS_FILE" <<EOF
+                            $WS_NAME = {
+                              organization          = "<+pipeline.variables.organizationId>"
+                              project               = "$PROJECT"
+                              cloud                 = "<+pipeline.variables.cloud>"
+                              workspace_template    = "$WS_TEMPLATE"
+                              pipeline_template     = "$PIPELINE_TEMPLATE"
+                              environment_tier      = "<+pipeline.variables.environment_tier>"
+                              iacm_code_repo        = "<+pipeline.variables.iacm_code_repo>"
+                              iacm_code_branch      = "<+pipeline.variables.iacm_code_branch>"
+                              iacm_code_path        = "<+pipeline.variables.iacm_code_path>"
+                              opentofu_version      = "1.8.0"
+                              gcp_project_id        = "<+pipeline.variables.gcp_project_id>"
+                              gcp_region            = "<+pipeline.variables.gcp_region>"
+                          $FOLDER_LINE
+                              gcp_connector         = "<+pipeline.variables.gcp_connector>"
+                              primary_owner         = "<+pipeline.variables.primary_owner_id>"
+                              secondary_owner       = "<+pipeline.variables.secondary_owner_id>"
+                              business_criticality  = "<+pipeline.variables.business_criticality>"
+                              data_sensitivity_level = "<+pipeline.variables.data_sensitivity_level>"
+                            }
+                          }
+                          EOF
+
+                          echo "=== Updated $TFVARS_FILE ==="
+                          cat "$TFVARS_FILE"
+
+              - step:
+                  name: Commit and Push
+                  identifier: commit_and_push
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          cd /tmp/iacm-workspace-repo
+
+                          BRANCH_NAME="<+pipeline.stages.generate_terraform_config.spec.execution.steps.clone_repo.output.outputVariables.BRANCH_NAME>"
+                          WS_NAME="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+
+                          git add workspaces-gcp.auto.tfvars
+                          git commit -m "feat(iacm): add workspace $WS_NAME"
+                          git push origin "$BRANCH_NAME"
+
+    - stage:
+        name: Create Pull Request
+        identifier: create_pull_request
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Create GitHub PR
+                  identifier: create_github_pr
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          GIT_API_BASE_URL="<+pipeline.variables.git_api_base_url>"
+                          GIT_ORG="<+pipeline.variables.git_org_or_owner>"
+                          GIT_REPO="<+pipeline.variables.git_repo_name>"
+                          BRANCH_NAME="<+pipeline.stages.generate_terraform_config.spec.execution.steps.clone_repo.output.outputVariables.BRANCH_NAME>"
+                          WS_NAME="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+                          ENV_TIER="<+pipeline.variables.environment_tier>"
+
+                          PR_BODY=$(cat <<EOF
+                          ## IaCM Workspace Provisioning Request
+
+                          Workspace: $WS_NAME  
+                          Environment: $ENV_TIER  
+                          Cloud: <+pipeline.variables.cloud>  
+                          Requested by: <+pipeline.variables.triggeredByName> / <+pipeline.variables.triggeredByEmail>
+
+                          This PR adds the workspace entry to workspaces-gcp.auto.tfvars.
+
+                          Triggered by Harness Pipeline: <+pipeline.executionUrl>
+                          EOF
+                          )
+
+                          PAYLOAD=$(jq -n \
+                            --arg title "feat(iacm): $WS_NAME ($ENV_TIER)" \
+                            --arg head "$BRANCH_NAME" \
+                            --arg base "main" \
+                            --arg body "$PR_BODY" \
+                            '{
+                              title: $title,
+                              head: $head,
+                              base: $base,
+                              body: $body
+                            }')
+
+                          PR_RESPONSE=$(curl -s -X POST \
+                            -H "Authorization: token ${GITHUB_TOKEN}" \
+                            -H "Accept: application/vnd.github.v3+json" \
+                            "${GIT_API_BASE_URL}/api/v3/repos/${GIT_ORG}/${GIT_REPO}/pulls" \
+                            -d "$PAYLOAD")
+
+                          PR_URL=$(echo "$PR_RESPONSE" | jq -r '.html_url // empty')
+                          PR_NUMBER=$(echo "$PR_RESPONSE" | jq -r '.number // empty')
+
+                          if [[ -z "$PR_URL" || "$PR_URL" == "null" ]]; then
+                            echo "ERROR: Failed to create PR"
+                            echo "$PR_RESPONSE" | jq .
+                            exit 1
+                          fi
+
+                          echo "PR_URL=$PR_URL"
+                          echo "PR_NUMBER=$PR_NUMBER"
+                    environmentVariables:
+                      - name: GITHUB_TOKEN
+                        type: Secret
+                        value: github-token
+                    outputVariables:
+                      - name: PR_URL
+                        type: String
+                        value: PR_URL
+                      - name: PR_NUMBER
+                        type: String
+                        value: PR_NUMBER
+
+    - stage:
+        name: Approval Gate
+        identifier: approval_gate
+        type: Approval
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Review and Approve
+                  identifier: review_and_approve
+                  type: HarnessApproval
+                  timeout: 7d
+                  spec:
+                    approvalMessage: |
+                      IaCM Workspace Provisioning Request
+
+                      Workspace: <+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>
+                      Project: <+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.PROJECT>
+                      Environment: <+pipeline.variables.environment_tier>
+                      Cloud: <+pipeline.variables.cloud>
+                      PR URL: <+pipeline.stages.create_pull_request.spec.execution.steps.create_github_pr.output.outputVariables.PR_URL>
+
+                      Please review the PR. On approval, this pipeline will merge the PR and verify workspace creation.
+                    includePipelineExecutionHistory: true
+                    isAutoRejectEnabled: false
+                    approvers:
+                      userGroups:
+                        - account.iacmapprovers
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                    approverInputs: []
+
+    - stage:
+        name: Merge PR and Verify
+        identifier: merge_pr_and_verify
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Merge Pull Request
+                  identifier: merge_pull_request
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          GIT_API_BASE_URL="<+pipeline.variables.git_api_base_url>"
+                          GIT_ORG="<+pipeline.variables.git_org_or_owner>"
+                          GIT_REPO="<+pipeline.variables.git_repo_name>"
+                          PR_NUMBER="<+pipeline.stages.create_pull_request.spec.execution.steps.create_github_pr.output.outputVariables.PR_NUMBER>"
+                          WS_NAME="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+
+                          MERGE_PAYLOAD=$(jq -n \
+                            --arg title "feat(iacm): provision workspace $WS_NAME" \
+                            --arg message "Auto-merged by Harness IaCM Intake Pipeline after approval." \
+                            '{
+                              commit_title: $title,
+                              commit_message: $message,
+                              merge_method: "squash"
+                            }')
+
+                          MERGE_RESPONSE=$(curl -s -X PUT \
+                            -H "Authorization: token ${GITHUB_TOKEN}" \
+                            -H "Accept: application/vnd.github.v3+json" \
+                            "${GIT_API_BASE_URL}/api/v3/repos/${GIT_ORG}/${GIT_REPO}/pulls/${PR_NUMBER}/merge" \
+                            -d "$MERGE_PAYLOAD")
+
+                          MERGED=$(echo "$MERGE_RESPONSE" | jq -r '.merged // false')
+                          MERGE_SHA=$(echo "$MERGE_RESPONSE" | jq -r '.sha // empty')
+
+                          if [[ "$MERGED" != "true" ]]; then
+                            echo "ERROR: Failed to merge PR #$PR_NUMBER"
+                            echo "$MERGE_RESPONSE" | jq .
+                            exit 1
+                          fi
+
+                          echo "MERGE_SHA=$MERGE_SHA"
+                    environmentVariables:
+                      - name: GITHUB_TOKEN
+                        type: Secret
+                        value: github-token
+                    outputVariables:
+                      - name: MERGE_SHA
+                        type: String
+                        value: MERGE_SHA
+
+              - step:
+                  name: Verify Workspace Exists
+                  identifier: verify_workspace_exists
+                  type: ShellScript
+                  timeout: 20m
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          WS_NAME="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+                          PROJECT="<+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.PROJECT>"
+                          ORG="<+pipeline.variables.organizationId>"
+                          ACCOUNT_ID="<+account.identifier>"
+                          HARNESS_BASE_URL="<+pipeline.variables.harness_base_url>"
+
+                          HARNESS_API="${HARNESS_BASE_URL}/gateway/iacm/api/orgs/${ORG}/projects/${PROJECT}/workspaces/${WS_NAME}?accountIdentifier=${ACCOUNT_ID}"
+
+                          MAX_ATTEMPTS=15
+                          POLL_INTERVAL=60
+                          ATTEMPT=1
+
+                          while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+                            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+                              -H "x-api-key: ${HARNESS_API_KEY}" \
+                              -H "Content-Type: application/json" \
+                              "$HARNESS_API")
+
+                            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}: HTTP ${RESPONSE}"
+
+                            if [[ "$RESPONSE" == "200" ]]; then
+                              WORKSPACE_URL="${HARNESS_BASE_URL}/account/${ACCOUNT_ID}/module/iacm/orgs/${ORG}/projects/${PROJECT}/workspaces/${WS_NAME}"
+
+                              echo "WORKSPACE_URL=$WORKSPACE_URL"
+                              echo "WORKSPACE_STATUS=created"
+                              exit 0
+                            fi
+
+                            sleep "$POLL_INTERVAL"
+                            ATTEMPT=$((ATTEMPT + 1))
+                          done
+
+                          echo "WARNING: Workspace not found after polling. Terraform may still be running."
+                          echo "WORKSPACE_URL="
+                          echo "WORKSPACE_STATUS=not_found"
+                          exit 1
+                    environmentVariables:
+                      - name: HARNESS_API_KEY
+                        type: Secret
+                        value: harness_platform_api_key
+                    outputVariables:
+                      - name: WORKSPACE_URL
+                        type: String
+                        value: WORKSPACE_URL
+                      - name: WORKSPACE_STATUS
+                        type: String
+                        value: WORKSPACE_STATUS
+
+              - step:
+                  name: Export Final Outputs to IDP
+                  identifier: export_final_outputs
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          echo "IaCM Workspace Provisioning Complete"
+                          echo "PR URL: <+pipeline.stages.create_pull_request.spec.execution.steps.create_github_pr.output.outputVariables.PR_URL>"
+                          echo "Merge SHA: <+execution.steps.merge_pull_request.output.outputVariables.MERGE_SHA>"
+                          echo "Workspace URL: <+execution.steps.verify_workspace_exists.output.outputVariables.WORKSPACE_URL>"
+                          echo "Workspace: <+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_NAME>"
+                          echo "Project: <+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.PROJECT>"
+                          echo "Template: <+pipeline.stages.validate_and_prepare.spec.execution.steps.validate_inputs.output.outputVariables.WS_TEMPLATE>"
+
+                          PipelineUrl="<+pipeline.executionUrl>"
+                          PullRequestUrl="<+pipeline.stages.create_pull_request.spec.execution.steps.create_github_pr.output.outputVariables.PR_URL>"
+                          WorkspaceUrl="<+execution.steps.verify_workspace_exists.output.outputVariables.WORKSPACE_URL>"
+                    outputVariables:
+                      - name: PipelineUrl
+                        type: String
+                        value: PipelineUrl
+                      - name: PullRequestUrl
+                        type: String
+                        value: PullRequestUrl
+                      - name: WorkspaceUrl
+                        type: String
+                        value: WorkspaceUrl
+
+    - stage:
+        name: Cleanup
+        identifier: cleanup
+        type: Custom
+        when:
+          pipelineStatus: All
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Ignore
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Cleanup Workspace
+                  identifier: cleanup_workspace
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          echo "Cleaning up"
+                          rm -rf /tmp/iacm-workspace-repo
+                          echo "Done"
