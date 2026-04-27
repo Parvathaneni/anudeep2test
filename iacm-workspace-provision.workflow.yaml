@@ -1,0 +1,219 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: iacm-workspace-provision
+  title: IaCM Workspace Provision
+  description: Self-service request for Harness IaCM workspace provisioning through a governed backend pipeline.
+  tags:
+    - harness
+    - iacm
+    - gcp
+spec:
+  owner: platform-engineering
+  type: service
+  parameters:
+    - title: IaCM Workspace Request
+      required:
+        - token
+        - request
+      properties:
+        token:
+          title: Harness Token
+          type: string
+          ui:widget: password
+          ui:field: HarnessAuthToken
+
+        request:
+          title: Workspace Details
+          type: object
+          required:
+            - organizationId
+            - projectId
+            - cloud
+            - environment_tier
+            - execution_mode
+            - primary_owner_id
+            - secondary_owner_id
+            - business_criticality
+            - data_sensitivity_level
+            - gcp_project_id
+            - gcp_region
+            - gcp_connector
+            - iacm_code_repo
+            - iacm_code_branch
+            - iacm_code_path
+          properties:
+            cloud:
+              title: Cloud
+              type: string
+              enum:
+                - gcp
+              default: gcp
+
+            organizationId:
+              title: Organization Id
+              type: string
+              default: default
+              pattern: "^[A-Za-z0-9._-]+$"
+
+            projectId:
+              title: Project Id
+              type: string
+              pattern: "^[A-Za-z0-9._-]+$"
+
+            application_id:
+              title: Application Id
+              type: string
+              description: Optional application inventory or CMDB identifier.
+
+            application_name:
+              title: Application Name
+              type: string
+              description: Optional friendly application name.
+
+            environment_tier:
+              title: Environment Tier
+              type: string
+              enum:
+                - dev
+                - stage
+                - prod
+              enumNames:
+                - Development
+                - Stage
+                - Production
+              default: stage
+
+            execution_mode:
+              title: Execution Mode
+              type: string
+              enum:
+                - plan_only
+                - plan_manual_apply
+                - auto_apply
+              enumNames:
+                - Plan only
+                - Plan and manual apply
+                - Auto apply
+              default: plan_manual_apply
+
+            primary_owner_id:
+              title: Primary Owner Email
+              type: string
+              format: email
+
+            secondary_owner_id:
+              title: Secondary Owner Email
+              type: string
+              format: email
+
+            business_criticality:
+              title: Business Criticality
+              type: string
+              enum:
+                - low
+                - medium
+                - high
+                - critical
+              default: low
+
+            data_sensitivity_level:
+              title: Data Sensitivity Level
+              type: string
+              enum:
+                - public
+                - internal
+                - confidential
+                - restricted
+              default: internal
+
+            gcp_project_id:
+              title: GCP Project Id
+              type: string
+              pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+
+            gcp_region:
+              title: GCP Region
+              type: string
+              enum:
+                - us-east1
+                - us-east4
+                - us-central1
+                - us-west1
+                - us-west2
+              default: us-east1
+
+            gcp_folder_id:
+              title: GCP Folder Id
+              type: string
+              description: Optional.
+
+            gcp_connector:
+              title: GCP Connector
+              type: string
+              pattern: "^[A-Za-z0-9._-]+$"
+
+            iacm_code_repo:
+              title: IaCM Code Repo
+              type: string
+              format: uri
+
+            iacm_code_branch:
+              title: IaCM Code Branch
+              type: string
+              default: main
+              pattern: "^[A-Za-z0-9._/-]+$"
+
+            iacm_code_path:
+              title: IaCM Code Path
+              type: string
+              default: "."
+
+  steps:
+    - id: trigger
+      name: Submit IaCM workspace request
+      action: trigger:harness-custom-pipeline
+      input:
+        url: "REPLACE_WITH_HARNESS_PIPELINE_URL"
+        hidePipelineURLLog: true
+        showOutputVariables: true
+        inputset:
+          organizationId: ${{ parameters.request.organizationId }}
+          projectId: ${{ parameters.request.projectId }}
+          application_id: ${{ parameters.request.application_id }}
+          application_name: ${{ parameters.request.application_name }}
+          cloud: ${{ parameters.request.cloud }}
+          environment_tier: ${{ parameters.request.environment_tier }}
+          execution_mode: ${{ parameters.request.execution_mode }}
+          primary_owner_id: ${{ parameters.request.primary_owner_id }}
+          secondary_owner_id: ${{ parameters.request.secondary_owner_id }}
+          business_criticality: ${{ parameters.request.business_criticality }}
+          data_sensitivity_level: ${{ parameters.request.data_sensitivity_level }}
+          gcp_project_id: ${{ parameters.request.gcp_project_id }}
+          gcp_region: ${{ parameters.request.gcp_region }}
+          gcp_folder_id: ${{ parameters.request.gcp_folder_id }}
+          gcp_connector: ${{ parameters.request.gcp_connector }}
+          iacm_code_repo: ${{ parameters.request.iacm_code_repo }}
+          iacm_code_branch: ${{ parameters.request.iacm_code_branch }}
+          iacm_code_path: ${{ parameters.request.iacm_code_path }}
+          idp_request_json: ${{ parameters.request | dump }}
+          triggeredByName: ${{ user.entity.metadata.name }}
+          triggeredByEmail: ${{ user.entity.spec.profile.email }}
+        apikey: ${{ parameters.token }}
+
+  output:
+    links:
+      - title: Pipeline Execution
+        url: ${{ steps.trigger.output.PipelineUrl }}
+      - title: Pull Request
+        url: ${{ steps.trigger.output.PullRequestUrl }}
+      - title: IaCM Workspace
+        url: ${{ steps.trigger.output.WorkspaceUrl }}
+    text:
+      - title: Workspace Request
+        content: |
+          Workspace `${{ steps.trigger.output.WorkspaceName }}` finished with status `${{ steps.trigger.output.WorkspaceStatus }}`.
+
+          Request ID: `${{ steps.trigger.output.RequestId }}`
+
+          Merge SHA: `${{ steps.trigger.output.MergeSha }}`
